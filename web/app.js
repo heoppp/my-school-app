@@ -16,6 +16,8 @@ const S = {
   inst: null, instAt: null, instDate: today(), instDay: {}, instFilter: "all", instDept: "", newInvite: null, instStudents: {}
 };
 const KINDS = ["Test", "Quiz", "Assignment", "Exam"];
+const COUNTRY_CODE = "92"; // used when a parent's number starts with 0 (e.g. 0300 1234567 -> 92300 1234567)
+S.month = today().slice(0, 7);
 const ROLE_NAME = { principal: "Principal", head: "Department head", teacher: "Teacher" };
 
 /* ---------------- helpers ---------------- */
@@ -38,6 +40,27 @@ function errMsg(e) {
   if (/password should be at least/i.test(m)) return "Password must be at least 6 characters.";
   if (/token has expired|invalid/i.test(m) && /otp|token/i.test(m)) return "That code is wrong or has expired. Ask for a new one.";
   return m;
+}
+function waNumber(p) {
+  let d = String(p || "").replace(/[^\d+]/g, "");
+  if (d.startsWith("+")) d = d.slice(1);
+  else if (d.startsWith("00")) d = d.slice(2);
+  else if (d.startsWith("0")) d = COUNTRY_CODE + d.slice(1);
+  return d.replace(/\D/g, "");
+}
+function openExternal(url) {
+  if (window.AndroidBridge && AndroidBridge.openUrl) AndroidBridge.openUrl(url);
+  else window.open(url, "_blank");
+}
+function saveFile(name, mime, text) {
+  if (window.AndroidBridge && AndroidBridge.saveFile) { AndroidBridge.saveFile(name, mime, text); return; }
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([text], { type: mime })); a.download = name;
+  document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+  toast("Saved " + name);
+}
+function printPage(title) {
+  if (window.AndroidBridge && AndroidBridge.print) AndroidBridge.print(title); else window.print();
 }
 function share(text) {
   if (window.AndroidBridge && AndroidBridge.share) AndroidBridge.share(text);
@@ -81,13 +104,13 @@ async function loadClass(id) {
   const [info, students, att, assess, scores] = await Promise.all([
     API.select("classes", `id=eq.${id}&select=*`),
     API.select("students", `${q}&select=*`),
-    API.select("attendance", `${q}&select=student_id,day,mark`),
+    API.select("attendance", `${q}&select=student_id,day,mark,notified_at`),
     API.select("assessments", `${q}&select=*&order=day.desc`),
     API.select("scores", `${q}&select=assessment_id,student_id,score`)
   ]);
   if (!info.length) { delete S.bundles[id]; return null; }
-  const b = { info: info[0], students, att: {}, assess, scores: {}, at: Date.now() };
-  att.forEach(r => { (b.att[r.day] = b.att[r.day] || {})[r.student_id] = r.mark; });
+  const b = { info: info[0], students, att: {}, notified: {}, assess, scores: {}, at: Date.now() };
+  att.forEach(r => { (b.att[r.day] = b.att[r.day] || {})[r.student_id] = r.mark; if (r.notified_at) (b.notified[r.day] = b.notified[r.day] || {})[r.student_id] = true; });
   scores.forEach(r => { (b.scores[r.assessment_id] = b.scores[r.assessment_id] || {})[r.student_id] = Number(r.score); });
   // Keep edits that are still being saved.
   const old = S.bundles[id];
@@ -134,11 +157,13 @@ async function route() {
   if (parts[0] === "inst") {
     if (parts[1] === "student" && parts[2]) return instStudentView(parts[2]);
     if (parts[1] === "class" && parts[2]) return instClassView(parts[2]);
+    if (parts[1] === "month" && parts[2]) return instMonthView(parts[2]);
     return instView(parts[1] || "overview");
   }
   if (parts[0] === "class" && parts[1]) {
     const id = parts[1];
     if (parts[2] === "student" && parts[3]) return studentView(id, parts[3]);
+    if (parts[2] === "month") return teacherMonthView(id);
     return classView(id, parts[2] || "attendance");
   }
   go("");
@@ -283,7 +308,8 @@ async function classesView() {
       ${S.classes == null ? `<div class="center muted">Loading classes…</div>` : list.length ? `<div class="card" style="padding:4px 16px"><div class="list">
         ${list.map(c => `<button class="item" data-act="nav" data-to="class/${c.id}/attendance"><span class="grow"><span class="name">${esc(c.name)}</span><span class="sub" style="display:block">${[c.subject, c.term].filter(Boolean).map(esc).join(" · ") || "&nbsp;"}</span></span>${c.department_id && S.member ? `<span class="chip info">${esc(deptName(c.department_id))}</span>` : ""}<span class="chip">${(c.students && c.students[0] && c.students[0].count) || 0} students</span><span class="chev">›</span></button>`).join("")}
       </div></div>` : `<div class="card"><div class="empty"><h3>No classes yet</h3><p>Create your first class, then add your students.</p></div></div>`}
-      <button class="btn primary block" data-act="nav" data-to="new-class">+ New class</button>`;
+      <button class="btn primary block" data-act="nav" data-to="new-class">+ New class</button>
+      ${window.AndroidBridge && AndroidBridge.version ? `<div class="sync">School App version ${esc(AndroidBridge.version())}</div>` : ""}`;
   };
   draw();
   try { await Promise.all([loadClasses(), loadMembership().catch(() => { S.member = null; })]); if (curHash() === "classes") draw(); } catch (e) { handleAuthError(e) || toast(errMsg(e)); }
@@ -359,7 +385,28 @@ function attendanceTab(id, b) {
       ${list.map(s => `<div class="item"><span class="roll">${esc(s.roll || "–")}</span><span class="grow name">${esc(s.name)}</span>
         <span class="marks">${["P", "L", "A"].map(m => `<button class="mark ${m} ${marks[s.id] === m ? "on" : ""}" data-act="mark" data-id="${id}" data-sid="${s.id}" data-m="${m}" aria-pressed="${marks[s.id] === m}" aria-label="${{ P: "Present", L: "Late", A: "Absent" }[m]}">${m}</button>`).join("")}</span></div>`).join("")}
     </div></div>
-    <p class="muted small">Tap P, L or A. Tap again to clear. Saves straight away.</p>`;
+    ${notifyCard(id, b)}
+    <p class="muted small">Tap P, L or A. Tap again to clear. Saves straight away.</p>
+    <button class="btn block" data-act="nav" data-to="class/${id}/month">Monthly attendance report</button>`;
+}
+function absentMessage(s, b, day) {
+  const when = day === today() ? `today, ${fmt(day, { weekday: "long", day: "numeric", month: "long", year: "numeric" })}` : `on ${fmt(day, { weekday: "long", day: "numeric", month: "long", year: "numeric" })}`;
+  const inst = S.member && S.member.institute ? S.member.institute.name : "";
+  const from = [b.info.teacher_name, inst].filter(Boolean).join(", ");
+  return `Assalam-o-Alaikum. This is to inform you that ${s.name}${s.roll ? " (Roll no. " + s.roll + ")" : ""} of ${b.info.name} was absent ${when}.${from ? "\n\n" + from : ""}`;
+}
+function notifyCard(id, b) {
+  const marks = b.att[S.date] || {};
+  const absent = sortSt(b.students).filter(s => marks[s.id] === "A");
+  if (!absent.length) return "";
+  const sent = b.notified[S.date] || {};
+  const done = absent.filter(s => sent[s.id]).length;
+  return `<div class="card"><div class="between"><h3>Tell parents</h3><span class="chip ${done === absent.length ? "ok" : ""}"><b>${done}/${absent.length}</b> sent</span></div>
+    <p class="muted small">Nothing is sent unless you tap. Each button opens WhatsApp or SMS with the message ready, and you tap send.</p>
+    <div class="list">${absent.map(s => `<div class="item"><span class="grow"><span class="name">${esc(s.name)}</span><span class="sub" style="display:block">${s.parent_phone ? esc(s.parent_phone) : "No parent number"}</span></span>
+      ${sent[s.id] ? `<span class="chip ok">✓ Sent</span>` : ""}
+      ${s.parent_phone ? `<button class="btn sm ${sent[s.id] ? "" : "primary"}" data-act="notify" data-via="wa" data-id="${id}" data-sid="${s.id}">WhatsApp</button><button class="btn sm" data-act="notify" data-via="sms" data-id="${id}" data-sid="${s.id}">SMS</button>`
+        : `<button class="btn sm" data-act="add-phone" data-id="${id}" data-sid="${s.id}">Add number</button>`}</div>`).join("")}</div></div>`;
 }
 
 function marksTab(id, b) {
@@ -412,6 +459,7 @@ function studentsTab(id, b) {
         <label class="field" style="flex:0 1 90px">Roll no.<input class="input" id="new-roll" name="roll" maxlength="10" inputmode="numeric"></label>
         <label class="field" style="flex:1 1 180px">Full name<input class="input" id="new-name" name="name" required maxlength="80"></label>
       </div>
+      <label class="field">Parent's WhatsApp number (optional)<input class="input" id="new-phone" name="phone" inputmode="tel" maxlength="20" placeholder="0300 1234567"></label>
       <button class="btn primary block" type="submit">Add student</button>
     </form>
     ${list.length ? `<div class="card" style="padding:4px 14px"><div class="list">${rows}</div></div>
@@ -444,8 +492,10 @@ function drawStudent(id, sid) {
       ${editing ? `<form class="stack" data-form="edit-student" data-id="${id}" data-sid="${sid}">
           <label class="field">Roll no.<input class="input" name="roll" maxlength="10" value="${esc(s.roll)}"></label>
           <label class="field">Full name<input class="input" name="name" required maxlength="80" value="${esc(s.name)}"></label>
+          <label class="field">Parent's WhatsApp number<input class="input" name="phone" inputmode="tel" maxlength="20" placeholder="0300 1234567" value="${esc(s.parent_phone || "")}"></label>
           <div class="row-wrap"><button class="btn primary" type="submit">Save</button><button class="btn" type="button" data-act="edit-student" data-sid="">Cancel</button></div>
-        </form>` : `<div class="row-wrap"><button class="btn" data-act="edit-student" data-sid="${sid}">Edit name or roll no.</button>
+        </form>` : `<p class="small">Parent's number: ${s.parent_phone ? `<b>${esc(s.parent_phone)}</b>` : `<span class="muted">not added</span>`}</p>
+        <div class="row-wrap"><button class="btn" data-act="edit-student" data-sid="${sid}">Edit name, roll no. or number</button>
         ${S.confirm === "rm-" + sid ? `<button class="btn danger" data-act="remove-student" data-id="${id}" data-sid="${sid}">Remove for good</button><button class="btn" data-act="cancel">Keep</button>` : `<button class="btn danger" data-act="confirm" data-key="rm-${sid}">Remove student</button>`}</div>`}
     </div>`;
 }
@@ -599,6 +649,7 @@ async function instClassView(cid) {
   if (!S.inst) { app.innerHTML = `<div class="center muted">Loading…</div>`; try { await loadInstitute(); } catch (e) { return handleAuthError(e) || toast(errMsg(e)); } }
   const k = S.inst.classes.find(x => x.id === cid); if (!k) return go("inst/results");
   app.innerHTML = `${topbar(k.name, { backTo: "inst/results", eyebrow: `${deptName(k.department_id)} · ${k.teacher_name || "Teacher"}` })}
+    <button class="btn block" data-act="nav" data-to="inst/month/${k.id}">Monthly attendance report</button>
     <div class="card"><h3>Tests, quizzes & exams</h3>
       ${k.assessments.length ? `<div class="list">${k.assessments.map(a => `<div class="item"><span class="grow"><span class="name">${esc(a.title)}</span><span class="sub" style="display:block">${esc(a.kind)} · ${esc(fmt(a.day, { day: "numeric", month: "short", year: "numeric" }))} · ${a.n}/${k.students.length} entered</span></span>
         <span class="num small">avg ${a.avg == null ? "–" : Number(a.avg).toFixed(1)} / ${Number(a.max)}</span></div>`).join("")}</div>` : `<p class="muted">No results entered yet.</p>`}
@@ -658,6 +709,75 @@ function inviteText(v) {
   return `You're invited to join ${i.name} on School App as ${v.role === "head" ? "a department head" : "a teacher"}.\n\n1. Install School App and open it.\n2. Tap "I'm a teacher" and create an account (or log in).\n3. On My classes, tap "Join with an invite code".\n4. Enter this code:\n\n${v.code}`;
 }
 
+/* ---------------- monthly attendance report ---------------- */
+function monthShift(ym, n) { const [y, m] = ym.split("-").map(Number); const d = new Date(y, m - 1 + n, 1); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`; }
+function monthData(students, attRows, ym) {
+  const [y, m] = ym.split("-").map(Number), days = new Date(y, m, 0).getDate();
+  const grid = {}; attRows.forEach(r => { if (String(r.d).slice(0, 7) === ym) (grid[r.s] = grid[r.s] || {})[Number(String(r.d).slice(8, 10))] = r.m; });
+  const used = new Set(); Object.values(grid).forEach(g => Object.keys(g).forEach(d => used.add(Number(d))));
+  const rows = sortSt(students).map(s => { const g = grid[s.id] || {}, t = { P: 0, L: 0, A: 0 }; Object.values(g).forEach(v => t[v]++); const n = t.P + t.L + t.A; return { s, g, t, pct: n ? (t.P + t.L) / n * 100 : null }; });
+  return { y, m, days, used, rows };
+}
+function monthReportHtml(title, sub, data, ym, backTo, key) {
+  const { y, m, days, used, rows } = data;
+  const wd = d => new Date(y, m - 1, d).toLocaleDateString(undefined, { weekday: "narrow" });
+  const isSun = d => new Date(y, m - 1, d).getDay() === 0;
+  const label = new Date(y, m - 1, 15).toLocaleDateString(undefined, { month: "long", year: "numeric" });
+  const schoolDays = used.size;
+  return `${topbar(title, { backTo, eyebrow: "Monthly attendance" })}
+    <div class="card no-print">
+      <div class="datebar"><button class="iconbtn" data-act="month" data-n="-1" aria-label="Previous month">‹</button><span class="day">${esc(label)}</span><button class="iconbtn" data-act="month" data-n="1" aria-label="Next month">›</button></div>
+      <div class="row-wrap"><button class="btn primary" style="flex:1" data-act="month-csv" data-key="${esc(key)}">Save as Excel</button><button class="btn" style="flex:1" data-act="month-pdf" data-key="${esc(key)}">Save as PDF</button></div>
+    </div>
+    <div class="print-head"><h2>${esc(title)} — ${esc(label)}</h2><div class="muted small">${esc(sub)}</div></div>
+    <div class="chips"><span class="chip info"><b>${schoolDays}</b> school days recorded</span><span class="chip"><b>${rows.length}</b> students</span></div>
+    ${rows.length ? `<div class="table-scroll"><table class="register"><thead><tr><th class="sticky">Roll</th><th class="sticky2">Name</th>
+      ${Array.from({ length: days }, (_, i) => i + 1).map(d => `<th class="${isSun(d) ? "sun" : ""} ${used.has(d) ? "" : "dim"}">${d}<br><small>${wd(d)}</small></th>`).join("")}
+      <th>P</th><th>L</th><th>A</th><th>%</th></tr></thead><tbody>
+      ${rows.map(r => `<tr><td class="sticky num">${esc(r.s.roll || "–")}</td><td class="sticky2">${esc(r.s.name)}</td>
+        ${Array.from({ length: days }, (_, i) => i + 1).map(d => `<td class="c ${r.g[d] || ""} ${isSun(d) ? "sun" : ""}">${r.g[d] || ""}</td>`).join("")}
+        <td class="num">${r.t.P}</td><td class="num">${r.t.L}</td><td class="num">${r.t.A}</td><td class="num ${r.pct != null && r.pct < ATT_MIN ? "low" : ""}">${pct(r.pct)}</td></tr>`).join("")}
+      </tbody></table></div>` : `<div class="card"><div class="empty"><p>No students in this class.</p></div></div>`}
+    <p class="muted small no-print">P present · L late (counts as attended) · A absent. Swipe the table sideways to see every day.</p>`;
+}
+function monthCsv(title, data, ym) {
+  const { days, rows } = data;
+  const q = v => { v = String(v ?? ""); return /[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v; };
+  const head = ["Roll", "Name", ...Array.from({ length: days }, (_, i) => String(i + 1)), "Present", "Late", "Absent", "Attendance %"];
+  const lines = [[title + " — " + ym], head, ...rows.map(r => [r.s.roll, r.s.name, ...Array.from({ length: days }, (_, i) => r.g[i + 1] || ""), r.t.P, r.t.L, r.t.A, r.pct == null ? "" : Math.round(r.pct)])];
+  return "﻿" + lines.map(l => l.map(q).join(",")).join("\r\n");
+}
+S.reports = {};
+async function teacherMonthView(id) {
+  if (!S.bundles[id]) { app.innerHTML = `<div class="center muted">Loading…</div>`; try { await loadClass(id); } catch (e) { return handleAuthError(e) || toast(errMsg(e)); } }
+  const b = S.bundles[id]; if (!b) return go("classes");
+  const rows = []; Object.keys(b.att).forEach(d => Object.entries(b.att[d]).forEach(([sid, mk]) => rows.push({ s: sid, d, m: mk })));
+  const data = monthData(b.students, rows, S.month), key = "c-" + id;
+  const title = b.info.name, sub = [b.info.subject, b.info.teacher_name && "Teacher: " + b.info.teacher_name, S.member && S.member.institute && S.member.institute.name].filter(Boolean).join(" · ");
+  S.reports[key] = { title, data, ym: S.month };
+  app.innerHTML = monthReportHtml(title, sub, data, S.month, `class/${id}/attendance`, key);
+}
+async function instMonthView(cid) {
+  app.innerHTML = `${topbar("Monthly attendance", { backTo: "inst/class/" + cid })}<div class="center muted">Loading…</div>`;
+  try {
+    const r = await API.rpc("institute_class_month", { p_class: cid, p_month: S.month + "-01" });
+    if (!r) { toast("That class isn't in your institute."); return go("inst/results"); }
+    if (curHash() !== "inst/month/" + cid) return;
+    const data = monthData(r.students, r.attendance, S.month), key = "i-" + cid;
+    const sub = [r.class.subject, r.class.teacher_name && "Teacher: " + r.class.teacher_name, S.inst && S.inst.institute.name].filter(Boolean).join(" · ");
+    S.reports[key] = { title: r.class.name, data, ym: S.month };
+    app.innerHTML = monthReportHtml(r.class.name, sub, data, S.month, "inst/class/" + cid, key);
+  } catch (e) { handleAuthError(e) || toast(errMsg(e)); }
+}
+
+/* ---------------- app updates ---------------- */
+window.SR_updateAvailable = function (info) {
+  const el = document.getElementById("update"); if (!el || !info || !info.apk) return;
+  el.innerHTML = `<span><b>New version ${esc(info.versionName || "")} is ready.</b> Your data and login stay the same.</span><button class="btn sm primary" id="update-btn">Update</button>`;
+  el.hidden = false;
+  document.getElementById("update-btn").onclick = () => { openExternal(info.apk); toast("Downloading… then tap the file and choose Update"); };
+};
+
 function handleAuthError(e) {
   if (e && (e.status === 401 || e.code === "no_session")) { toast("Please log in again."); go("teacher"); return true; }
   return false;
@@ -667,6 +787,7 @@ function handleAuthError(e) {
 function redraw() {
   const h = curHash(), p = h.split("/");
   if (p[0] === "inst" && !p[1] || (p[0] === "inst" && ["overview", "attendance", "results", "staff"].includes(p[1]))) drawInst(p[1] || "overview");
+  else if (p[0] === "class" && p[2] === "month") teacherMonthView(p[1]);
   else if (p[0] === "class" && p[2] === "student") drawStudent(p[1], p[3]);
   else if (p[0] === "class") drawClass(p[1], p[2] || "attendance");
   else route();
@@ -716,6 +837,11 @@ app.addEventListener("click", async e => {
   else if (act === "logout-code") { S.code = null; S.report = null; LS.set("sr_code", null); swap(""); }
   else if (act === "refresh-report") { reportView(true); }
   else if (act === "reset-again") { S.resetEmail = null; S.error = ""; forgotView(); }
+  else if (act === "notify") notifyParent(d.id, d.sid, d.via);
+  else if (act === "add-phone") { S.editStudent = d.sid; go(`class/${d.id}/student/${d.sid}`); }
+  else if (act === "month") { S.month = monthShift(S.month, Number(d.n)); route(); }
+  else if (act === "month-csv") { const r = S.reports[d.key]; if (r) saveFile(`${r.title.replace(/[^\w\- ]+/g, "").trim() || "class"} attendance ${r.ym}.csv`, "text/csv", monthCsv(r.title, r.data, r.ym)); }
+  else if (act === "month-pdf") { const r = S.reports[d.key]; printPage(r ? `${r.title} attendance ${r.ym}` : "Attendance"); }
   else if (act === "inst-refresh") { S.instStudents = {}; instView(curHash().split("/")[1] || "overview"); }
   else if (act === "inst-day") { S.instDate = shift(S.instDate, Number(d.n)); loadDay(); }
   else if (act === "pick-inst-date") { const i = document.getElementById("inst-date"); if (i) { try { i.showPicker(); } catch { i.click(); } } }
@@ -792,15 +918,16 @@ app.addEventListener("submit", async e => {
     } else if (kind === "student") {
       const id = f.dataset.id, b = S.bundles[id], roll = v.roll.trim();
       if (roll && b.students.some(s => s.roll === roll)) throw new Error(`Roll no. ${roll} is already used in this class.`);
-      const s = await track(API.insert("students", { class_id: id, name: v.name.trim(), roll }));
+      const s = await track(API.insert("students", { class_id: id, name: v.name.trim(), roll, parent_phone: (v.phone || "").trim() }));
       b.students.push(s); toast(`Added ${s.name}`); redraw();
       const r = document.getElementById("new-roll"); if (r) { r.value = roll && !isNaN(roll) ? String(Number(roll) + 1) : ""; }
+      const ph = document.getElementById("new-phone"); if (ph) ph.value = "";
       const n = document.getElementById("new-name"); if (n) n.focus();
       return;
     } else if (kind === "edit-student") {
       const { id, sid } = f.dataset, b = S.bundles[id], roll = v.roll.trim();
       if (roll && b.students.some(s => s.roll === roll && s.id !== sid)) throw new Error(`Roll no. ${roll} is already used in this class.`);
-      const s = await track(API.update("students", `id=eq.${sid}`, { name: v.name.trim(), roll }));
+      const s = await track(API.update("students", `id=eq.${sid}`, { name: v.name.trim(), roll, parent_phone: (v.phone || "").trim() }));
       const i = b.students.findIndex(x => x.id === sid); if (i >= 0 && s) b.students[i] = s;
       S.editStudent = null; toast("Saved"); redraw();
     } else if (kind === "institute") {
@@ -836,6 +963,14 @@ app.addEventListener("submit", async e => {
   } finally { if (btn && btn.isConnected) btn.disabled = false; }
 });
 
+function notifyParent(id, sid, via) {
+  const b = S.bundles[id], s = b && b.students.find(x => x.id === sid); if (!s) return;
+  const day = S.date, text = absentMessage(s, b, day), num = waNumber(s.parent_phone);
+  if (!num) { toast("Add the parent's number first."); return; }
+  openExternal(via === "sms" ? `sms:${s.parent_phone.replace(/[^\d+]/g, "")}?body=${encodeURIComponent(text)}` : `https://wa.me/${num}?text=${encodeURIComponent(text)}`);
+  (b.notified[day] = b.notified[day] || {})[sid] = true; redraw();
+  track(API.update("attendance", `student_id=eq.${sid}&day=eq.${day}`, { notified_at: new Date().toISOString() })).catch(() => {});
+}
 async function loadDay() {
   redraw();
   try { S.instDay = (await API.rpc("institute_day", { p_day: S.instDate })) || {}; redraw(); } catch (e) { toast(errMsg(e)); }
@@ -854,16 +989,19 @@ function setMark(id, sid, m) {
   redraw();
   const p = next ? API.upsert("attendance", { student_id: sid, class_id: id, day, mark: next }, "student_id,day")
                  : API.remove("attendance", `student_id=eq.${sid}&day=eq.${day}`);
-  track(p).then(() => { if (b.unsaved[key] === apply) delete b.unsaved[key]; redraw(); },
-    err => { delete b.unsaved[key]; const x = b.att[day]; if (prev) x[sid] = prev; else delete x[sid]; toast(errMsg(err)); redraw(); });
+  track(p).then(() => { const bb = S.bundles[id] || b; if (bb.unsaved && bb.unsaved[key] === apply) delete bb.unsaved[key]; redraw(); },
+    err => { const bb = S.bundles[id] || b; if (bb.unsaved) delete bb.unsaved[key]; const x = (bb.att[day] = bb.att[day] || {}); if (prev) x[sid] = prev; else delete x[sid]; toast(errMsg(err)); redraw(); });
 }
 function allPresent(id) {
   const b = S.bundles[id], day = S.date, cur = (b.att[day] = b.att[day] || {});
   const rows = b.students.filter(s => !cur[s.id]).map(s => ({ student_id: s.id, class_id: id, day, mark: "P" }));
   if (!rows.length) return;
-  rows.forEach(r => cur[r.student_id] = "P"); redraw();
-  track(API.upsert("attendance", rows, "student_id,day")).then(() => { toast(`${rows.length} marked present`); redraw(); },
-    err => { rows.forEach(r => { if (cur[r.student_id] === "P") delete cur[r.student_id]; }); toast(errMsg(err)); redraw(); });
+  // Keep these marks on screen even if a background refresh lands before the save finishes.
+  const apply = bb => { const x = (bb.att[day] = bb.att[day] || {}); rows.forEach(r => { if (!x[r.student_id]) x[r.student_id] = "P"; }); };
+  const key = "allp/" + day + "/" + Date.now();
+  apply(b); (b.unsaved = b.unsaved || {})[key] = apply; redraw();
+  track(API.upsert("attendance", rows, "student_id,day")).then(() => { const bb = S.bundles[id]; if (bb && bb.unsaved) delete bb.unsaved[key]; toast(`${rows.length} marked present`); redraw(); },
+    err => { const bb = S.bundles[id] || b; if (bb.unsaved) delete bb.unsaved[key]; const x = bb.att[day] || {}; rows.forEach(r => { if (x[r.student_id] === "P") delete x[r.student_id]; }); toast(errMsg(err)); redraw(); });
 }
 
 /* ---------------- automatic updates ---------------- */

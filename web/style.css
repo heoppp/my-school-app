@@ -138,3 +138,34 @@ button.item { width: 100%; background: none; border: none; border-bottom: 1px so
   .mark, .tab, .btn, .assess { transition: background-color .15s, color .15s, border-color .15s; }
   .pbar i { transition: width .3s ease; }
 }
+
+/* update banner */
+.update { position: sticky; top: 0; z-index: 30; display: flex; gap: 10px; align-items: center; justify-content: space-between;
+  background: var(--accent-soft); color: var(--ink); border-bottom: 1px solid var(--rule);
+  padding: calc(10px + env(safe-area-inset-top, 0px)) max(16px, env(safe-area-inset-right, 0px)) 10px max(16px, env(safe-area-inset-left, 0px)); font-size: .9rem; }
+.update[hidden] { display: none; }
+
+/* monthly register */
+.table-scroll { overflow-x: auto; background: var(--card); border: 1px solid var(--rule); border-radius: 14px; }
+table.register { border-collapse: separate; border-spacing: 0; font-size: .8rem; min-width: 100%; }
+.register th, .register td { padding: 6px 5px; border-bottom: 1px solid var(--rule); text-align: center; white-space: nowrap; background: var(--card); }
+.register th { font-weight: 700; color: var(--muted); font-size: .72rem; line-height: 1.1; }
+.register th small { font-weight: 500; }
+.register .sticky { position: sticky; left: 0; z-index: 2; min-width: 2.4rem; }
+.register .sticky2 { position: sticky; left: 2.4rem; z-index: 2; text-align: left; min-width: 8rem; max-width: 11rem; overflow: hidden; text-overflow: ellipsis; box-shadow: 1px 0 0 var(--rule); }
+.register td.c { font-family: var(--mono); font-weight: 700; min-width: 1.6rem; }
+.register td.P { color: var(--present); } .register td.L { color: var(--late); } .register td.A { color: var(--absent); background: var(--absent-soft); }
+.register .sun { background: var(--bg); } .register th.dim { opacity: .45; }
+.register td.low { color: var(--absent); font-weight: 700; }
+.print-head { display: none; }
+
+@media print {
+  @page { size: landscape; margin: 10mm; }
+  :root { --bg: #fff; --card: #fff; --ink: #000; --muted: #444; --rule: #bbb; }
+  .no-print, .topbar, .update, .toast, .sync, .tabs { display: none !important; }
+  .print-head { display: block; margin-bottom: 6px; }
+  .app { max-width: none; padding: 0; }
+  .table-scroll { overflow: visible; border: none; }
+  .register { font-size: 8pt; } .register th, .register td { padding: 2px 3px; border: 1px solid #bbb; }
+  .register .sticky, .register .sticky2 { position: static; box-shadow: none; }
+}

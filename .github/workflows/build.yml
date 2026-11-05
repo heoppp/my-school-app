@@ -28,6 +28,21 @@ jobs:
             echo "No secrets set: the app will ask for the server details on first launch."
           fi
 
+      # SIGNING_KEY secret = the app's permanent signing key (base64). Using the same key
+      # every time lets phones install updates over the old version.
+      - name: Add signing key
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+        run: |
+          if [ -n "$SIGNING_KEY" ]; then
+            echo "$SIGNING_KEY" | tr -d ' \n\r' | base64 -d > "$RUNNER_TEMP/release.keystore"
+            echo "SIGNING_KEYSTORE=$RUNNER_TEMP/release.keystore" >> "$GITHUB_ENV"
+            echo "SIGNING_PASSWORD=schoolapp-release" >> "$GITHUB_ENV"
+            echo "Signing with the release key."
+          else
+            echo "::warning::No SIGNING_KEY secret: phones will need to uninstall before each update."
+          fi
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -40,8 +55,12 @@ jobs:
       - name: Build APK
         run: gradle :app:assembleRelease --no-daemon
 
-      - name: Rename APK
-        run: cp app/build/outputs/apk/release/app-release.apk SchoolApp.apk
+      - name: Rename APK and write version info
+        run: |
+          cp app/build/outputs/apk/release/app-release.apk SchoolApp.apk
+          printf '{"versionCode": %s, "versionName": "1.%s", "apk": "https://github.com/%s/releases/download/latest/SchoolApp.apk"}\n' \
+            "$GITHUB_RUN_NUMBER" "$GITHUB_RUN_NUMBER" "$GITHUB_REPOSITORY" > version.json
+          cat version.json
 
       - uses: actions/upload-artifact@v4
         with:
@@ -55,4 +74,6 @@ jobs:
           name: Latest build
           body: Download SchoolApp.apk below and open it on an Android phone to install.
           make_latest: true
-          files: SchoolApp.apk
+          files: |
+            SchoolApp.apk
+            version.json

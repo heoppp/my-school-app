@@ -484,3 +484,30 @@ revoke all on function public.get_report(text) from public;
 grant execute on function public.get_report(text) to anon, authenticated;
 
 notify pgrst, 'reload schema';
+-- ============ PARENT MESSAGES & MONTHLY REPORTS ============
+-- Parent's phone number (only the class teacher can see it).
+alter table public.students add column if not exists parent_phone text not null default '';
+do $$ begin
+  alter table public.students add constraint students_parent_phone_check check (char_length(parent_phone) <= 20);
+exception when duplicate_object then null; end $$;
+
+-- When the teacher sent the "absent today" message to the parent.
+alter table public.attendance add column if not exists notified_at timestamptz;
+
+-- Principal: one class's attendance for one month (view only).
+create or replace function public.institute_class_month(p_class uuid, p_month date) returns json
+language plpgsql stable security definer set search_path = public as $$
+declare iid uuid := public.need_principal();
+  m0 date := date_trunc('month', p_month)::date;
+begin
+  if not exists (select 1 from public.classes k where k.id = p_class and k.institute_id = iid) then return null; end if;
+  return json_build_object(
+    'class', (select json_build_object('id', k.id, 'name', k.name, 'subject', k.subject, 'teacher_name', k.teacher_name) from public.classes k where k.id = p_class),
+    'students', coalesce((select json_agg(json_build_object('id', s.id, 'name', s.name, 'roll', s.roll)) from public.students s where s.class_id = p_class), '[]'::json),
+    'attendance', coalesce((select json_agg(json_build_object('s', a.student_id, 'd', a.day, 'm', a.mark))
+                            from public.attendance a where a.class_id = p_class and a.day >= m0 and a.day < (m0 + interval '1 month')::date), '[]'::json));
+end $$;
+revoke all on function public.institute_class_month(uuid, date) from public, anon;
+grant execute on function public.institute_class_month(uuid, date) to authenticated;
+
+notify pgrst, 'reload schema';
