@@ -1,0 +1,58 @@
+name: Build app
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # If you saved SUPABASE_URL and SUPABASE_ANON_KEY as repository secrets,
+      # they are built into the app so nobody has to type them in.
+      - name: Add school server details
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          if [ -n "$SUPABASE_URL" ] && [ -n "$SUPABASE_ANON_KEY" ]; then
+            printf 'window.SR_CONFIG = { url: "%s", key: "%s" };\n' "$SUPABASE_URL" "$SUPABASE_ANON_KEY" > web/config.js
+            echo "Server details added to the app."
+          else
+            echo "No secrets set: the app will ask for the server details on first launch."
+          fi
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.14.3'
+
+      - name: Build APK
+        run: gradle :app:assembleRelease --no-daemon
+
+      - name: Rename APK
+        run: cp app/build/outputs/apk/release/app-release.apk SchoolApp.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SchoolApp.apk
+          path: SchoolApp.apk
+
+      - name: Publish to "latest" release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest build
+          body: Download SchoolApp.apk below and open it on an Android phone to install.
+          make_latest: true
+          files: SchoolApp.apk
