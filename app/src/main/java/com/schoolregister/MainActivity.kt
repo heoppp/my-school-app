@@ -63,9 +63,16 @@ class MainActivity : Activity() {
         web.evaluateJavascript("window.SR_onResume && window.SR_onResume()", null)
     }
 
+    /**
+     * The phone's back button moves to the parent screen inside the app.
+     * On a first screen (My classes, a student's record, welcome) it closes the app,
+     * so it never goes back to the log-in page.
+     */
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
-        if (web.canGoBack()) web.goBack() else @Suppress("DEPRECATION") super.onBackPressed()
+        web.evaluateJavascript("window.SR_back ? String(window.SR_back()) : 'false'") { result ->
+            if (result == null || !result.contains("true")) finish()
+        }
     }
 
     /** Lets the screens share codes (WhatsApp, SMS…) and copy text. */

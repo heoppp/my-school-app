@@ -11,18 +11,24 @@ const S = {
   classes: null,          // teacher's classes
   bundles: {},            // class id -> { info, students, att, assess, scores, at }
   report: null, reportAt: null, code: LS.get("sr_code"),
-  date: today(), selAssess: {}, confirm: null, error: "", pending: 0, editStudent: null
+  date: today(), selAssess: {}, confirm: null, error: "", pending: 0, editStudent: null,
+  member: undefined,      // my institute membership (null = not in one)
+  inst: null, instAt: null, instDate: today(), instDay: {}, instFilter: "all", instDept: "", newInvite: null, instStudents: {}
 };
+const KINDS = ["Test", "Quiz", "Assignment", "Exam"];
+const ROLE_NAME = { principal: "Principal", head: "Department head", teacher: "Teacher" };
 
 /* ---------------- helpers ---------------- */
 function today(d = new Date()) { const z = n => String(n).padStart(2, "0"); return `${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())}`; }
 function shift(iso, n) { const d = new Date(iso + "T12:00:00"); d.setDate(d.getDate() + n); return today(d); }
 function fmt(iso, o = { weekday: "short", day: "numeric", month: "short" }) { return new Date(String(iso).slice(0, 10) + "T12:00:00").toLocaleDateString(undefined, o); }
 function esc(s) { return String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+function plural(n, one, many) { return n + " " + (n === 1 ? one : many); }
 function pct(n) { return n == null || isNaN(n) ? "–" : Math.round(n) + "%"; }
 let tt; function toast(m) { toastEl.textContent = m; toastEl.hidden = false; clearTimeout(tt); tt = setTimeout(() => toastEl.hidden = true, 2800); }
 function go(h) { if (location.hash === "#" + h) route(); else location.hash = h; }
-function back(fallback) { if (history.length > 1 && S.navDepth > 0) history.back(); else go(fallback); }
+function back(to) { location.replace("#" + to); }          // in-app ‹ always goes to the parent screen
+function swap(h) { location.replace("#" + h); }            // go somewhere without leaving a form in history
 function sortSt(list) { return [...list].sort((a, b) => (Number(a.roll) || 9999) - (Number(b.roll) || 9999) || a.name.localeCompare(b.name)); }
 function errMsg(e) {
   const m = (e && e.message) || "Something went wrong.";
@@ -62,13 +68,13 @@ function studentData(b, sid) {
   const att = Object.keys(b.att).sort().filter(d => b.att[d][sid]).map(d => ({ d, m: b.att[d][sid] }));
   const grades = [...b.assess].sort((x, y) => String(x.day).localeCompare(y.day))
     .filter(a => b.scores[a.id] && b.scores[a.id][sid] != null)
-    .map(a => ({ t: a.title, d: a.day, m: Number(a.max_marks), s: Number(b.scores[a.id][sid]) }));
+    .map(a => ({ t: a.title, k: a.kind, d: a.day, m: Number(a.max_marks), s: Number(b.scores[a.id][sid]) }));
   return { att, grades };
 }
 
 /* ---------------- data ---------------- */
 async function loadClasses() {
-  S.classes = await API.select("classes", "select=id,name,subject,term,teacher_name,students(count)&order=created_at.asc");
+  S.classes = await API.select("classes", "select=id,name,subject,term,teacher_name,department_id,students(count)&order=created_at.asc");
 }
 async function loadClass(id) {
   const q = `class_id=eq.${id}`;
@@ -89,6 +95,17 @@ async function loadClass(id) {
   S.bundles[id] = b;
   return b;
 }
+async function loadMembership() {
+  S.member = (await API.rpc("my_membership", {})) || null;
+}
+async function loadInstitute() {
+  const [o, day] = await Promise.all([API.rpc("institute_overview", {}), API.rpc("institute_day", { p_day: S.instDate })]);
+  S.inst = o; S.instDay = day || {}; S.instAt = Date.now();
+}
+function deptName(id) {
+  const list = (S.inst && S.inst.departments) || (S.member && S.member.departments) || [];
+  const d = list.find(x => x.id === id); return d ? d.name : "No department";
+}
 function track(p) { S.pending++; return p.finally(() => { S.pending--; }); }
 
 /* ---------------- router ---------------- */
@@ -99,11 +116,9 @@ async function route() {
   const h = location.hash.replace(/^#\/?/, "");
   const parts = h.split("/");
   if (!API.config()) return setupView();
-  if (h === "" ) {
-    if (API.signedIn) return go("classes");
-    if (S.code) return go("report");
-    return welcomeView();
-  }
+  if (API.signedIn && ["", "teacher", "signup", "forgot", "code", "report", "setup"].includes(h)) return swap("classes");
+  if (!API.signedIn && S.code && ["", "code"].includes(h)) return swap("report");
+  if (h === "") return welcomeView();
   if (h === "setup") return setupView();
   if (h === "teacher") return loginView();
   if (h === "signup") return signupView();
@@ -112,7 +127,15 @@ async function route() {
   if (h === "report") return reportView();
   if (!API.signedIn) return go("teacher");
   if (h === "classes") return classesView();
+  if (S.member === undefined) { try { await loadMembership(); } catch { S.member = null; } }
   if (h === "new-class") return classFormView(null);
+  if (h === "institute-new") return instituteFormView();
+  if (h === "join") return joinView();
+  if (parts[0] === "inst") {
+    if (parts[1] === "student" && parts[2]) return instStudentView(parts[2]);
+    if (parts[1] === "class" && parts[2]) return instClassView(parts[2]);
+    return instView(parts[1] || "overview");
+  }
   if (parts[0] === "class" && parts[1]) {
     const id = parts[1];
     if (parts[2] === "student" && parts[3]) return studentView(id, parts[3]);
@@ -211,13 +234,13 @@ function drawReport() {
   const r = S.report, c = r.class || {};
   app.innerHTML = `
     ${topbar(r.name, { eyebrow: r.role === "parent" ? "Parent view" : "My record", right: `<button class="iconbtn" data-act="refresh-report" aria-label="Refresh">↻</button>` })}
-    <div class="muted small">${[c.name, c.subject, c.teacher && "Teacher: " + c.teacher, c.term, r.roll && "Roll no. " + r.roll].filter(Boolean).map(esc).join(" · ")}</div>
+    <div class="muted small">${[c.institute, c.department, c.name, c.subject, c.teacher && "Teacher: " + c.teacher, c.term, r.roll && "Roll no. " + r.roll].filter(Boolean).map(esc).join(" · ")}</div>
     ${reportCard(r.attendance || [], (r.grades || []).map(g => ({ ...g, m: Number(g.m), s: Number(g.s) })))}
     <div class="sync">Updated ${esc(S.reportAt.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }))} · refreshes by itself</div>
     <button class="btn" data-act="logout-code">Log out</button>`;
 }
 
-function reportCard(att, grades) {
+function reportCard(att, grades, { openDays = false } = {}) {
   const a = attStats(att), g = avg(grades);
   const aColor = a.pct == null ? "var(--rule)" : a.pct < ATT_MIN ? "var(--absent)" : "var(--present)";
   const months = {};
@@ -239,8 +262,12 @@ function reportCard(att, grades) {
     ${recent.length ? `<div class="card"><h3>Recent days</h3><div class="dots">${recent.map(x => `<span class="dot ${x.m}" title="${esc(fmt(x.d))}"><span><b>${x.m}</b><br>${new Date(String(x.d).slice(0, 10) + "T12:00:00").getDate()}</span></span>`).join("")}</div>
       <p class="muted small">P present · L late · A absent. Numbers are the day of the month.</p></div>` : ""}
     ${Object.keys(months).length > 1 ? `<div class="card"><h3>By month</h3><div class="list">${Object.keys(months).sort().reverse().map(k => { const s = attStats(months[k]); return `<div class="item"><span class="grow">${esc(fmt(k + "-15", { month: "long", year: "numeric" }))}</span><span class="num small">${s.P + s.L}/${s.total} days</span><span class="chip ${s.pct < ATT_MIN ? "warn" : "ok"}">${pct(s.pct)}</span></div>`; }).join("")}</div></div>` : ""}
-    <div class="card"><h3>Marks</h3>
-      ${grades.length ? `<div>${[...grades].reverse().map(x => `<div class="grade"><div><div class="name">${esc(x.t)}</div><div class="muted small">${esc(fmt(x.d, { day: "numeric", month: "short", year: "numeric" }))}</div></div><span class="num">${x.s} / ${x.m}</span><div class="pbar"><i style="width:${x.m ? Math.min(100, x.s / x.m * 100) : 0}%"></i></div></div>`).join("")}</div>` : `<p class="muted">No marks entered yet.</p>`}
+    ${att.length ? `<details class="card" ${openDays ? "open" : ""}><summary><h3 style="display:inline">Every day</h3> <span class="muted small">(${att.length} days)</span></summary>
+      <div class="list">${Object.keys(months).sort().reverse().map(k => `<div class="eyebrow" style="padding-top:10px">${esc(fmt(k + "-15", { month: "long", year: "numeric" }))}</div>` +
+        [...months[k]].reverse().map(x => `<div class="item"><span class="grow">${esc(fmt(x.d, { weekday: "long", day: "numeric", month: "short" }))}</span><span class="chip ${x.m}">${{ P: "Present", L: "Late", A: "Absent" }[x.m]}</span></div>`).join("")).join("")}</div>
+    </details>` : ""}
+    <div class="card"><h3>Results</h3>
+      ${grades.length ? `<div>${[...grades].reverse().map(x => `<div class="grade"><div><div class="name">${esc(x.t)}${x.k ? ` <span class="chip">${esc(x.k)}</span>` : ""}</div><div class="muted small">${esc(fmt(x.d, { day: "numeric", month: "short", year: "numeric" }))}</div></div><span class="num">${x.s} / ${x.m}</span><div class="pbar"><i style="width:${x.m ? Math.min(100, x.s / x.m * 100) : 0}%"></i></div></div>`).join("")}</div>` : `<p class="muted">No results entered yet.</p>`}
     </div>`;
 }
 
@@ -249,14 +276,17 @@ async function classesView() {
   const draw = () => {
     const list = S.classes || [];
     app.innerHTML = `
-      ${topbar("My classes", { eyebrow: API.user && API.user.name ? API.user.name : "Teacher", right: `<button class="iconbtn" data-act="logout" aria-label="Log out" title="Log out">⎋</button>` })}
+      ${topbar("My classes", { eyebrow: API.user && API.user.name ? API.user.name : "Teacher", right: `<button class="btn sm" data-act="logout">Log out</button>` })}
+      ${S.confirm === "logout" ? `<div class="card"><p>Log out of <b>${esc((API.user && API.user.email) || "this account")}</b>? You'll need your email and password to log in again.</p>
+        <div class="row-wrap"><button class="btn danger" data-act="logout">Log out</button><button class="btn" data-act="cancel">Stay logged in</button></div></div>` : ""}
+      ${instituteCard()}
       ${S.classes == null ? `<div class="center muted">Loading classes…</div>` : list.length ? `<div class="card" style="padding:4px 16px"><div class="list">
-        ${list.map(c => `<button class="item" data-act="nav" data-to="class/${c.id}/attendance"><span class="grow"><span class="name">${esc(c.name)}</span><span class="sub" style="display:block">${[c.subject, c.term].filter(Boolean).map(esc).join(" · ") || "&nbsp;"}</span></span><span class="chip">${(c.students && c.students[0] && c.students[0].count) || 0} students</span><span class="chev">›</span></button>`).join("")}
+        ${list.map(c => `<button class="item" data-act="nav" data-to="class/${c.id}/attendance"><span class="grow"><span class="name">${esc(c.name)}</span><span class="sub" style="display:block">${[c.subject, c.term].filter(Boolean).map(esc).join(" · ") || "&nbsp;"}</span></span>${c.department_id && S.member ? `<span class="chip info">${esc(deptName(c.department_id))}</span>` : ""}<span class="chip">${(c.students && c.students[0] && c.students[0].count) || 0} students</span><span class="chev">›</span></button>`).join("")}
       </div></div>` : `<div class="card"><div class="empty"><h3>No classes yet</h3><p>Create your first class, then add your students.</p></div></div>`}
       <button class="btn primary block" data-act="nav" data-to="new-class">+ New class</button>`;
   };
   draw();
-  try { await loadClasses(); if (curHash() === "classes") draw(); } catch (e) { handleAuthError(e) || toast(errMsg(e)); }
+  try { await Promise.all([loadClasses(), loadMembership().catch(() => { S.member = null; })]); if (curHash() === "classes") draw(); } catch (e) { handleAuthError(e) || toast(errMsg(e)); }
 }
 
 function classFormView(b) {
@@ -267,6 +297,10 @@ function classFormView(b) {
       <label class="field">Subject<input class="input" name="subject" maxlength="60" placeholder="Mathematics" value="${esc(i.subject)}"></label>
       <label class="field">Term<input class="input" name="term" maxlength="40" placeholder="Term 2, 2026" value="${esc(i.term)}"></label>
       <label class="field">Teacher name (shown to students and parents)<input class="input" name="teacher_name" maxlength="60" value="${esc(i.teacher_name)}"></label>
+      ${S.member && S.member.departments.length ? `<label class="field">Department<select class="input" name="department_id">
+        <option value="">No department</option>
+        ${S.member.departments.map(d => `<option value="${d.id}" ${(b ? i.department_id : S.member.department_id) === d.id ? "selected" : ""}>${esc(d.name)}</option>`).join("")}
+      </select></label>` : ""}
       ${S.error ? `<div class="error">${esc(S.error)}</div>` : ""}
       <button class="btn primary block" type="submit">${b ? "Save" : "Create class"}</button>
     </form>
@@ -334,22 +368,23 @@ function marksTab(id, b) {
   if (!b.assess.find(a => a.id === aid)) aid = S.selAssess[id] = b.assess[0] && b.assess[0].id;
   const a = b.assess.find(x => x.id === aid);
   const form = `<form class="card" data-form="assess" data-id="${id}">
-      <h3>New test or assignment</h3>
+      <h3>New test, quiz or exam</h3>
       <label class="field">Name<input class="input" name="title" required maxlength="60" placeholder="Unit 3 test"></label>
+      <label class="field">Type<select class="input" name="kind">${KINDS.map(k => `<option>${k}</option>`).join("")}</select></label>
       <div class="row-wrap" style="align-items:end">
         <label class="field" style="flex:1 1 120px">Out of<input class="input" name="max" type="number" min="1" max="1000" step="any" value="20" required></label>
         <label class="field" style="flex:1 1 150px">Date<input class="input" name="day" type="date" value="${today()}" required></label>
       </div>
       <button class="btn primary block" type="submit">Add</button>
     </form>`;
-  if (!a) return `<div class="card"><div class="empty"><h3>No marks yet</h3><p>Add a test, quiz or homework below, then type each student's score.</p></div></div>${form}`;
+  if (!a) return `<div class="card"><div class="empty"><h3>No marks yet</h3><p>Add a test, quiz, assignment or exam below, then type each student's score.</p></div></div>${form}`;
   const list = sortSt(b.students), sc = b.scores[a.id] || {};
   const vals = list.map(s => sc[s.id]).filter(v => v != null);
   const mean = vals.length ? vals.reduce((t, v) => t + v, 0) / vals.length : null;
   return `
-    <div class="assess-strip">${b.assess.map(x => `<button class="assess ${x.id === a.id ? "on" : ""}" data-act="pick-assess" data-id="${id}" data-aid="${x.id}">${esc(x.title)}<small>${esc(fmt(x.day, { day: "numeric", month: "short" }))} · /${Number(x.max_marks)}</small></button>`).join("")}</div>
+    <div class="assess-strip">${b.assess.map(x => `<button class="assess ${x.id === a.id ? "on" : ""}" data-act="pick-assess" data-id="${id}" data-aid="${x.id}">${esc(x.title)}<small>${esc(x.kind || "Test")} · ${esc(fmt(x.day, { day: "numeric", month: "short" }))} · /${Number(x.max_marks)}</small></button>`).join("")}</div>
     <div class="card">
-      <div class="between"><div><h3>${esc(a.title)}</h3><div class="muted small">${esc(fmt(a.day, { weekday: "long", day: "numeric", month: "long" }))} · out of <span class="num">${Number(a.max_marks)}</span></div></div>
+      <div class="between"><div><h3>${esc(a.title)}</h3><div class="muted small">${esc(a.kind || "Test")} · ${esc(fmt(a.day, { weekday: "long", day: "numeric", month: "long" }))} · out of <span class="num">${Number(a.max_marks)}</span></div></div>
         ${S.confirm === "del-" + a.id ? `<div class="row-wrap"><button class="btn sm danger" data-act="delete-assess" data-id="${id}" data-aid="${a.id}">Delete</button><button class="btn sm" data-act="cancel">Keep</button></div>` : `<button class="btn sm danger" data-act="confirm" data-key="del-${a.id}">Delete</button>`}</div>
       <div class="chips"><span class="chip info">Average <b>${mean == null ? "–" : mean.toFixed(1)}</b></span><span class="chip">Highest <b>${vals.length ? Math.max(...vals) : "–"}</b></span><span class="chip">Lowest <b>${vals.length ? Math.min(...vals) : "–"}</b></span><span class="chip"><b>${vals.length}/${list.length}</b> entered</span></div>
     </div>
@@ -415,6 +450,214 @@ function drawStudent(id, sid) {
     </div>`;
 }
 
+/* ---------------- institute: teachers' side ---------------- */
+function instituteCard() {
+  const m = S.member;
+  if (m === undefined) return "";
+  if (!m) return `<div class="card"><div><div class="eyebrow">Institute</div><h3>Is your school or college using School App?</h3></div>
+    <p class="muted small">Principals create the institute and invite teachers. Your classes stay private to you; only the principal can view them.</p>
+    <div class="stack"><button class="btn primary" data-act="nav" data-to="institute-new">Create an institute (I'm the principal)</button>
+    <button class="btn" data-act="nav" data-to="join">Join with an invite code</button></div></div>`;
+  const i = m.institute;
+  return `<div class="card"><div class="between"><div><div class="eyebrow">${esc(i.kind)}${i.city ? " · " + esc(i.city) : ""}</div><h3>${esc(i.name)}</h3>
+      <div class="muted small">${esc(ROLE_NAME[m.role])}${m.department_id ? " · " + esc(deptName(m.department_id)) : ""}</div></div>
+      ${m.role === "principal" ? `<button class="btn primary sm" data-act="nav" data-to="inst/overview">Principal dashboard</button>` : ""}</div>
+    ${m.role !== "principal" ? `<p class="muted small">Your classes are private to you. The principal can view them but can't change them.</p>` : ""}</div>`;
+}
+function instituteFormView() {
+  const i = (S.inst && S.inst.institute) || null;
+  app.innerHTML = `${topbar(i ? "Institute details" : "Create an institute", { backTo: i ? "inst/staff" : "classes" })}
+    <form class="card" data-form="institute">
+      ${i ? "" : `<p class="muted">You'll be the <b>principal</b>. Next you'll add departments and invite teachers and department heads.</p>`}
+      <label class="field">Type<select class="input" name="kind">${["School", "College", "University", "Academy", "Organization"].map(k => `<option ${i && i.kind === k ? "selected" : ""}>${k}</option>`).join("")}</select></label>
+      <label class="field">Name<input class="input" name="name" required maxlength="100" placeholder="Government High School No. 1" value="${esc(i ? i.name : "")}"></label>
+      <label class="field">City<input class="input" name="city" maxlength="60" value="${esc(i ? i.city : "")}"></label>
+      ${i ? "" : `<label class="field">Your name<input class="input" name="my_name" required maxlength="80" value="${esc((API.user && API.user.name) || "")}"></label>`}
+      ${S.error ? `<div class="error">${esc(S.error)}</div>` : ""}
+      <button class="btn primary block" type="submit">${i ? "Save" : "Create institute"}</button>
+    </form>`;
+}
+function joinView() {
+  app.innerHTML = `${topbar("Join an institute", { backTo: "classes" })}
+    <form class="card" data-form="join">
+      <p class="muted">Type the invite code your principal sent you. Each code works once.</p>
+      <input class="input code-input" name="code" required maxlength="11" placeholder="XXXXX-XXXXX" autocomplete="off" autocapitalize="characters" spellcheck="false">
+      <label class="field">Your name<input class="input" name="my_name" required maxlength="80" value="${esc((API.user && API.user.name) || "")}"></label>
+      ${S.error ? `<div class="error">${esc(S.error)}</div>` : ""}
+      <button class="btn primary block" type="submit">Join</button>
+    </form>`;
+}
+
+/* ---------------- institute: principal dashboard (view only) ---------------- */
+async function instView(tab) {
+  if (S.inst) drawInst(tab); else app.innerHTML = `${topbar("Principal", { backTo: "classes" })}<div class="center muted">Loading institute…</div>`;
+  try { await loadInstitute(); if (curHash().split("/")[0] === "inst") drawInst(tab); }
+  catch (e) { if (!handleAuthError(e)) { toast(errMsg(e)); if (/only the principal/i.test(errMsg(e))) go("classes"); } }
+}
+function allStudents() {
+  const out = [];
+  (S.inst.classes || []).forEach(k => k.students.forEach(s => out.push({ ...s, cls: k })));
+  return out;
+}
+function sAtt(s) { const t = s.P + s.L + s.A; return t ? (s.P + s.L) / t * 100 : null; }
+function deptFilterSelect() {
+  const ds = S.inst.departments;
+  if (!ds.length) return "";
+  return `<select class="input" id="inst-dept" style="flex:1 1 160px"><option value="">All departments</option>
+    ${ds.map(d => `<option value="${d.id}" ${S.instDept === d.id ? "selected" : ""}>${esc(d.name)}</option>`).join("")}
+    <option value="none" ${S.instDept === "none" ? "selected" : ""}>No department</option></select>`;
+}
+function classesInFilter() {
+  return (S.inst.classes || []).filter(k => !S.instDept || (S.instDept === "none" ? !k.department_id : k.department_id === S.instDept));
+}
+function groupByDept(classes) {
+  const groups = {};
+  classes.forEach(k => { const key = k.department_id || "none"; (groups[key] = groups[key] || []).push(k); });
+  return Object.keys(groups).sort((a, b) => deptName(a === "none" ? null : a).localeCompare(deptName(b === "none" ? null : b))).map(key => ({ id: key, name: key === "none" ? "No department" : deptName(key), classes: groups[key] }));
+}
+function drawInst(tab) {
+  if (!S.inst) return;
+  const i = S.inst.institute;
+  const tabs = [["overview", "Overview"], ["attendance", "Attendance"], ["results", "Results"], ["staff", "Staff"]];
+  app.innerHTML = `
+    ${topbar(i.name, { backTo: "classes", eyebrow: `Principal · ${i.kind}${i.city ? " · " + i.city : ""}`, right: `<button class="iconbtn" data-act="inst-refresh" aria-label="Refresh">↻</button>` })}
+    <div class="tabs" role="tablist">${tabs.map(([k, l]) => `<button class="tab ${tab === k ? "on" : ""}" data-act="nav" data-to="inst/${k}" data-replace="1">${l}</button>`).join("")}</div>
+    ${tab === "attendance" ? instAttendance() : tab === "results" ? instResults() : tab === "staff" ? instStaff() : instOverview()}
+    <div class="sync">View only · updated ${new Date(S.instAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}</div>`;
+}
+function dayCounts(students) {
+  const c = { P: 0, L: 0, A: 0, none: 0 };
+  students.forEach(s => { const m = S.instDay[s.id]; if (m) c[m]++; else c.none++; });
+  return c;
+}
+function instOverview() {
+  const st = allStudents(), teachers = S.inst.members.filter(m => m.role !== "principal");
+  const isToday = S.instDate === today();
+  const groups = groupByDept(S.inst.classes);
+  const flagged = st.filter(s => { const a = sAtt(s); return (a != null && a < ATT_MIN) || (s.avg != null && s.avg < PASS_MIN); })
+    .sort((a, b) => (sAtt(a) ?? 100) - (sAtt(b) ?? 100)).slice(0, 25);
+  const c = dayCounts(st);
+  if (!S.inst.classes.length) return `<div class="card"><div class="empty"><h3>No classes yet</h3><p>Add departments and invite your teachers in the <b>Staff</b> tab. Their classes will appear here.</p><button class="btn primary" data-act="nav" data-to="inst/staff" data-replace="1">Go to Staff</button></div></div>`;
+  return `
+    <div class="chips"><span class="chip info"><b>${S.inst.departments.length}</b> departments</span><span class="chip info"><b>${teachers.length}</b> teachers</span><span class="chip info"><b>${S.inst.classes.length}</b> classes</span><span class="chip info"><b>${st.length}</b> students</span></div>
+    <div class="card"><div class="between"><h3>${isToday ? "Today" : esc(fmt(S.instDate))}</h3><button class="btn sm" data-act="nav" data-to="inst/attendance" data-replace="1">See who</button></div>
+      <div class="chips"><span class="chip P"><b>${c.P}</b> present</span><span class="chip L"><b>${c.L}</b> late</span><span class="chip A"><b>${c.A}</b> absent</span><span class="chip"><b>${c.none}</b> not marked</span></div>
+      <div class="list">${groups.map(g => { const ss = g.classes.flatMap(k => k.students), gc = dayCounts(ss), marked = gc.P + gc.L + gc.A;
+        return `<div class="item"><span class="grow"><span class="name">${esc(g.name)}</span><span class="sub" style="display:block">${plural(g.classes.length, "class", "classes")} · ${plural(ss.length, "student", "students")}</span></span>
+          <span class="chip A"><b>${gc.A}</b> absent</span><span class="chip ${marked && (gc.P + gc.L) / marked * 100 < ATT_MIN ? "warn" : "ok"}">${marked ? pct((gc.P + gc.L) / marked * 100) : "–"}</span></div>`; }).join("")}</div>
+    </div>
+    <div class="card"><h3>Students needing attention</h3>
+      ${flagged.length ? `<div class="list">${flagged.map(s => `<button class="item" data-act="nav" data-to="inst/student/${s.id}"><span class="grow"><span class="name">${esc(s.name)}</span><span class="sub" style="display:block">${esc(s.cls.name)} · ${esc(deptName(s.cls.department_id))}</span></span>
+        ${sAtt(s) != null && sAtt(s) < ATT_MIN ? `<span class="chip warn">Att. ${pct(sAtt(s))}</span>` : ""}${s.avg != null && s.avg < PASS_MIN ? `<span class="chip warn">Avg ${pct(s.avg)}</span>` : ""}<span class="chev">›</span></button>`).join("")}</div>`
+        : `<p class="muted">Nobody is below ${ATT_MIN}% attendance or a ${PASS_MIN}% average.</p>`}
+    </div>`;
+}
+function instAttendance() {
+  const isToday = S.instDate === today();
+  const f = S.instFilter;
+  const groups = groupByDept(classesInFilter());
+  const show = s => { const m = S.instDay[s.id]; return f === "all" || (f === "none" ? !m : m === f); };
+  const body = groups.map(g => {
+    const cards = g.classes.map(k => {
+      const ss = k.students.filter(show); if (!ss.length) return "";
+      const kc = dayCounts(k.students);
+      return `<div class="card" style="padding:12px 14px"><div class="between"><div><b>${esc(k.name)}</b><div class="muted small">${esc(k.teacher_name || "")}${k.subject ? " · " + esc(k.subject) : ""}</div></div>
+          <div class="chips"><span class="chip P"><b>${kc.P}</b></span><span class="chip L"><b>${kc.L}</b></span><span class="chip A"><b>${kc.A}</b></span></div></div>
+        <div class="list">${ss.map(s => { const m = S.instDay[s.id]; return `<button class="item" data-act="nav" data-to="inst/student/${s.id}"><span class="roll">${esc(s.roll || "–")}</span><span class="grow name">${esc(s.name)}</span>
+          ${m ? `<span class="chip ${m}">${{ P: "Present", L: "Late", A: "Absent" }[m]}</span>` : `<span class="chip">Not marked</span>`}</button>`; }).join("")}</div></div>`;
+    }).join("");
+    return cards ? `<div class="eyebrow" style="padding-top:6px">${esc(g.name)}</div>${cards}` : "";
+  }).join("");
+  const filters = [["all", "Everyone"], ["A", "Absent"], ["L", "Late"], ["P", "Present"], ["none", "Not marked"]];
+  return `
+    <div class="card">
+      <div class="datebar">
+        <button class="iconbtn" data-act="inst-day" data-n="-1" aria-label="Previous day">‹</button>
+        <label class="day">${isToday ? "Today, " : ""}${esc(fmt(S.instDate))}<input type="date" id="inst-date" value="${S.instDate}" aria-label="Choose date"></label>
+        <button class="iconbtn" data-act="pick-inst-date" aria-label="Choose date">📅</button>
+        <button class="iconbtn" data-act="inst-day" data-n="1" aria-label="Next day">›</button>
+      </div>
+      <div class="chips">${filters.map(([k, l]) => `<button class="chip ${f === k ? "info" : ""}" style="border:none" data-act="inst-filter" data-f="${k}">${l}</button>`).join("")}</div>
+      ${deptFilterSelect() ? `<div class="row-wrap">${deptFilterSelect()}</div>` : ""}
+    </div>
+    ${body || `<div class="card"><div class="empty"><p>No students match this filter on this day.</p></div></div>`}
+    <p class="muted small">Tap a student to see every date they were present, late or absent.</p>`;
+}
+function instResults() {
+  const groups = groupByDept(classesInFilter());
+  return `${deptFilterSelect() ? `<div class="row-wrap">${deptFilterSelect()}</div>` : ""}
+    ${groups.map(g => `<div class="eyebrow" style="padding-top:6px">${esc(g.name)}</div>` + g.classes.map(k => {
+      const atts = k.students.map(sAtt).filter(v => v != null), avgs = k.students.map(s => s.avg).filter(v => v != null);
+      const mean = a => a.length ? a.reduce((t, v) => t + v, 0) / a.length : null;
+      return `<button class="card" style="text-align:left;width:100%" data-act="nav" data-to="inst/class/${k.id}">
+        <div class="between"><div><b>${esc(k.name)}</b><div class="muted small">${esc(k.teacher_name || "")}${k.subject ? " · " + esc(k.subject) : ""} · ${k.students.length} students</div></div><span class="chev">›</span></div>
+        <div class="chips"><span class="chip info">Attendance <b>${pct(mean(atts))}</b></span><span class="chip info">Average <b>${pct(mean(avgs))}</b></span><span class="chip"><b>${k.assessments.length}</b> tests & quizzes</span></div>
+        ${k.assessments.slice(0, 3).map(a => `<div class="small muted">${esc(a.kind)} · ${esc(a.title)} · ${esc(fmt(a.day, { day: "numeric", month: "short" }))} · avg ${a.avg == null ? "–" : Number(a.avg).toFixed(1)}/${Number(a.max)}</div>`).join("")}
+      </button>`; }).join("")).join("") || `<div class="card"><div class="empty"><p>No classes yet.</p></div></div>`}`;
+}
+async function instClassView(cid) {
+  if (!S.inst) { app.innerHTML = `<div class="center muted">Loading…</div>`; try { await loadInstitute(); } catch (e) { return handleAuthError(e) || toast(errMsg(e)); } }
+  const k = S.inst.classes.find(x => x.id === cid); if (!k) return go("inst/results");
+  app.innerHTML = `${topbar(k.name, { backTo: "inst/results", eyebrow: `${deptName(k.department_id)} · ${k.teacher_name || "Teacher"}` })}
+    <div class="card"><h3>Tests, quizzes & exams</h3>
+      ${k.assessments.length ? `<div class="list">${k.assessments.map(a => `<div class="item"><span class="grow"><span class="name">${esc(a.title)}</span><span class="sub" style="display:block">${esc(a.kind)} · ${esc(fmt(a.day, { day: "numeric", month: "short", year: "numeric" }))} · ${a.n}/${k.students.length} entered</span></span>
+        <span class="num small">avg ${a.avg == null ? "–" : Number(a.avg).toFixed(1)} / ${Number(a.max)}</span></div>`).join("")}</div>` : `<p class="muted">No results entered yet.</p>`}
+    </div>
+    <div class="card" style="padding:4px 14px"><div class="list">${k.students.map(s => { const a = sAtt(s); const flag = (a != null && a < ATT_MIN) || (s.avg != null && s.avg < PASS_MIN);
+      return `<button class="item" data-act="nav" data-to="inst/student/${s.id}"><span class="roll">${esc(s.roll || "–")}</span><span class="grow"><span class="name">${esc(s.name)}</span>
+        <span class="sub" style="display:block">Attendance ${pct(a)} (${s.A} absent) · Average ${pct(s.avg)}</span></span>${flag ? `<span class="chip warn">Check</span>` : ""}<span class="chev">›</span></button>`; }).join("") || `<p class="muted" style="padding:12px 0">No students yet.</p>`}</div></div>`;
+}
+async function instStudentView(sid) {
+  const draw = r => {
+    if (curHash() !== "inst/student/" + sid) return;
+    const c = r.class || {};
+    app.innerHTML = `${topbar(r.name, { backTo: "inst/attendance", eyebrow: [c.department, c.name].filter(Boolean).join(" · ") })}
+      <div class="muted small">${[c.subject, c.teacher && "Teacher: " + c.teacher, c.term, r.roll && "Roll no. " + r.roll].filter(Boolean).map(esc).join(" · ")}</div>
+      ${reportCard(r.attendance || [], (r.grades || []).map(g => ({ ...g, m: Number(g.m), s: Number(g.s) })), { openDays: true })}
+      <p class="muted small">View only. Only the class teacher can change attendance or marks.</p>`;
+  };
+  if (S.instStudents[sid]) draw(S.instStudents[sid]); else app.innerHTML = `<div class="center muted">Loading record…</div>`;
+  try {
+    const r = await API.rpc("institute_student", { p_sid: sid });
+    if (!r) { toast("That student isn't in your institute."); return go("inst/overview"); }
+    S.instStudents[sid] = r; draw(r);
+  } catch (e) { handleAuthError(e) || toast(errMsg(e)); }
+}
+function instStaff() {
+  const ds = S.inst.departments, inv = S.newInvite;
+  const deptOptions = sel => `<option value="">No department</option>${ds.map(d => `<option value="${d.id}" ${sel === d.id ? "selected" : ""}>${esc(d.name)}</option>`).join("")}`;
+  const classCount = uid => S.inst.classes.filter(k => k.teacher_id === uid).length;
+  return `
+    <div class="card"><h3>Departments</h3>
+      ${ds.length ? `<div class="list">${ds.map(d => `<div class="item"><span class="grow name">${esc(d.name)}</span><span class="chip">${plural(S.inst.classes.filter(k => k.department_id === d.id).length, "class", "classes")}</span>
+        ${S.confirm === "deldept-" + d.id ? `<button class="btn sm danger" data-act="del-dept" data-id="${d.id}">Delete</button><button class="btn sm" data-act="cancel">Keep</button>` : `<button class="btn sm" data-act="confirm" data-key="deldept-${d.id}" aria-label="Delete ${esc(d.name)}">✕</button>`}</div>`).join("")}</div>` : `<p class="muted small">Add departments like Science, Arts or Primary. Teachers choose one for each class.</p>`}
+      <form class="row-wrap" data-form="dept"><input class="input" id="dept-name" name="name" required maxlength="60" placeholder="New department" style="flex:1 1 160px"><button class="btn" type="submit">Add</button></form>
+    </div>
+    <form class="card" data-form="invite"><h3>Invite a teacher or department head</h3>
+      <label class="field">Their name<input class="input" id="inv-name" name="name" required maxlength="80" placeholder="Ms. Sara Ahmed"></label>
+      <div class="row-wrap">
+        <label class="field" style="flex:1 1 140px">Role<select class="input" name="role"><option value="teacher">Teacher</option><option value="head">Department head</option></select></label>
+        <label class="field" style="flex:1 1 160px">Department<select class="input" name="department">${deptOptions("")}</select></label>
+      </div>
+      <button class="btn primary block" type="submit">Create invite code</button>
+      ${inv ? `<div class="codebox"><div class="eyebrow">Invite for ${esc(inv.name)}</div><div class="code">${esc(inv.code)}</div>
+        <div class="row-wrap"><button class="btn sm primary" data-act="share" data-text="${esc(inviteText(inv))}">Share</button><button class="btn sm" data-act="copy" data-text="${esc(inv.code)}">Copy</button></div>
+        <p class="muted small">Send it only to ${esc(inv.name)}. It works once.</p></div>` : ""}
+    </form>
+    ${S.inst.invites.length ? `<div class="card"><h3>Invites not used yet</h3><div class="list">${S.inst.invites.map(v => `<div class="item"><span class="grow"><span class="name">${esc(v.name)}</span><span class="sub" style="display:block">${esc(ROLE_NAME[v.role])} · ${esc(deptName(v.department_id))} · <span class="num">${esc(v.code)}</span></span></span>
+      <button class="btn sm" data-act="share" data-text="${esc(inviteText(v))}">Share</button>
+      ${S.confirm === "delinv-" + v.code ? `<button class="btn sm danger" data-act="del-invite" data-code="${esc(v.code)}">Cancel invite</button>` : `<button class="btn sm" data-act="confirm" data-key="delinv-${esc(v.code)}" aria-label="Cancel invite">✕</button>`}</div>`).join("")}</div></div>` : ""}
+    <div class="card"><h3>Staff</h3><div class="list">${S.inst.members.map(m => `<div class="item"><span class="grow"><span class="name">${esc(m.name || "Unnamed")}</span>
+      <span class="sub" style="display:block">${esc(ROLE_NAME[m.role])}${m.role !== "principal" ? " · " + esc(deptName(m.department_id)) + " · " + plural(classCount(m.user_id), "class", "classes") : ""}</span></span>
+      ${m.role === "principal" ? "" : S.confirm === "rm-" + m.user_id ? `<button class="btn sm danger" data-act="remove-member" data-uid="${m.user_id}">Remove</button><button class="btn sm" data-act="cancel">Keep</button>` : `<button class="btn sm" data-act="confirm" data-key="rm-${m.user_id}" aria-label="Remove">✕</button>`}</div>`).join("")}</div>
+      <p class="muted small">Removing someone takes their classes out of the institute. Their classes and data are not deleted.</p></div>
+    <button class="btn block" data-act="nav" data-to="institute-new">Edit institute details</button>`;
+}
+function inviteText(v) {
+  const i = S.inst.institute;
+  return `You're invited to join ${i.name} on School App as ${v.role === "head" ? "a department head" : "a teacher"}.\n\n1. Install School App and open it.\n2. Tap "I'm a teacher" and create an account (or log in).\n3. On My classes, tap "Join with an invite code".\n4. Enter this code:\n\n${v.code}`;
+}
+
 function handleAuthError(e) {
   if (e && (e.status === 401 || e.code === "no_session")) { toast("Please log in again."); go("teacher"); return true; }
   return false;
@@ -423,7 +666,8 @@ function handleAuthError(e) {
 /* ---------------- actions ---------------- */
 function redraw() {
   const h = curHash(), p = h.split("/");
-  if (p[0] === "class" && p[2] === "student") drawStudent(p[1], p[3]);
+  if (p[0] === "inst" && !p[1] || (p[0] === "inst" && ["overview", "attendance", "results", "staff"].includes(p[1]))) drawInst(p[1] || "overview");
+  else if (p[0] === "class" && p[2] === "student") drawStudent(p[1], p[3]);
   else if (p[0] === "class") drawClass(p[1], p[2] || "attendance");
   else route();
 }
@@ -465,14 +709,26 @@ app.addEventListener("click", async e => {
     try { await track(API.remove("classes", `id=eq.${d.id}`)); delete S.bundles[d.id]; S.classes = null; toast("Class deleted"); go("classes"); }
     catch (err) { toast(errMsg(err)); }
   }
-  else if (act === "logout") { await API.signOut(); S.bundles = {}; S.classes = null; go(""); }
-  else if (act === "logout-code") { S.code = null; S.report = null; LS.set("sr_code", null); go(""); }
+  else if (act === "logout") {
+    if (S.confirm !== "logout") { S.confirm = "logout"; return route(); }
+    S.confirm = null; await API.signOut(); S.bundles = {}; S.classes = null; S.member = undefined; S.inst = null; S.instStudents = {}; swap("");
+  }
+  else if (act === "logout-code") { S.code = null; S.report = null; LS.set("sr_code", null); swap(""); }
   else if (act === "refresh-report") { reportView(true); }
   else if (act === "reset-again") { S.resetEmail = null; S.error = ""; forgotView(); }
+  else if (act === "inst-refresh") { S.instStudents = {}; instView(curHash().split("/")[1] || "overview"); }
+  else if (act === "inst-day") { S.instDate = shift(S.instDate, Number(d.n)); loadDay(); }
+  else if (act === "pick-inst-date") { const i = document.getElementById("inst-date"); if (i) { try { i.showPicker(); } catch { i.click(); } } }
+  else if (act === "inst-filter") { S.instFilter = d.f; redraw(); }
+  else if (act === "del-dept") { S.confirm = null; instAction(API.rpc("delete_department", { p_id: d.id }), "Department deleted"); }
+  else if (act === "del-invite") { S.confirm = null; instAction(API.rpc("delete_invite", { p_code: d.code }), "Invite cancelled"); }
+  else if (act === "remove-member") { S.confirm = null; instAction(API.rpc("remove_member", { p_user: d.uid }), "Removed from the institute"); }
 });
 
 app.addEventListener("change", e => {
   if (e.target.id === "pick-date" && e.target.value) { S.date = e.target.value; redraw(); }
+  if (e.target.id === "inst-date" && e.target.value) { S.instDate = e.target.value; loadDay(); }
+  if (e.target.id === "inst-dept") { S.instDept = e.target.value; redraw(); }
 });
 
 const timers = {};
@@ -513,25 +769,26 @@ app.addEventListener("submit", async e => {
       API.saveServer(url, v.key);
       go("");
     } else if (kind === "login") {
-      await API.signIn(v.email.trim(), v.password); go("classes");
+      await API.signIn(v.email.trim(), v.password); S.member = undefined; swap("classes");
     } else if (kind === "signup") {
       const r = await API.signUp(v.email.trim(), v.password, v.name.trim());
-      if (r.signedIn) go("classes");
+      if (r.signedIn) { S.member = undefined; swap("classes"); }
       else { S.error = ""; app.innerHTML = `${topbar("Check your email", { backTo: "teacher" })}<div class="card"><p>We sent a link to <b>${esc(v.email)}</b>. Open it to confirm your account, then come back and log in.</p><button class="btn primary" data-act="nav" data-to="teacher">Go to log in</button></div>`; }
     } else if (kind === "forgot") {
       await API.resetPassword(v.email.trim()); S.resetEmail = v.email.trim(); toast("Email sent. Check your inbox."); forgotView();
     } else if (kind === "reset") {
-      await API.finishReset(S.resetEmail, v.code.trim(), v.password); S.resetEmail = null; toast("Password changed"); go("classes");
+      await API.finishReset(S.resetEmail, v.code.trim(), v.password); S.resetEmail = null; toast("Password changed"); swap("classes");
     } else if (kind === "code") {
       const code = v.code.replace(/[^A-Za-z0-9]/g, "").toUpperCase();
       if (code.length !== 10) throw new Error("Codes have 10 letters and numbers, like ABCDE-23456.");
       S.code = code; const ok = await fetchReport();
       if (!ok) throw new Error("That code didn't work. Check it with your teacher.");
-      LS.set("sr_code", code); go("report");
+      LS.set("sr_code", code); swap("report");
     } else if (kind === "class") {
       const row = { name: v.name.trim(), subject: v.subject.trim(), term: v.term.trim(), teacher_name: v.teacher_name.trim() };
+      if (S.member) { row.institute_id = S.member.institute.id; if ("department_id" in v) row.department_id = v.department_id || null; }
       if (f.dataset.id) { await track(API.update("classes", `id=eq.${f.dataset.id}`, row)); S.bundles[f.dataset.id].info = { ...S.bundles[f.dataset.id].info, ...row }; toast("Saved"); go(`class/${f.dataset.id}/attendance`); }
-      else { const c = await track(API.insert("classes", row)); S.classes = null; go(`class/${c.id}/students`); }
+      else { const c = await track(API.insert("classes", row)); S.classes = null; swap(`class/${c.id}/students`); }
     } else if (kind === "student") {
       const id = f.dataset.id, b = S.bundles[id], roll = v.roll.trim();
       if (roll && b.students.some(s => s.roll === roll)) throw new Error(`Roll no. ${roll} is already used in this class.`);
@@ -546,19 +803,46 @@ app.addEventListener("submit", async e => {
       const s = await track(API.update("students", `id=eq.${sid}`, { name: v.name.trim(), roll }));
       const i = b.students.findIndex(x => x.id === sid); if (i >= 0 && s) b.students[i] = s;
       S.editStudent = null; toast("Saved"); redraw();
+    } else if (kind === "institute") {
+      if (S.inst && S.member && S.member.role === "principal" && S.inst.institute) {
+        await track(API.rpc("update_institute", { p_name: v.name.trim(), p_kind: v.kind, p_city: v.city.trim() }));
+        toast("Saved"); await loadInstitute(); go("inst/staff");
+      } else {
+        await track(API.rpc("create_institute", { p_name: v.name.trim(), p_kind: v.kind, p_city: v.city.trim(), p_my_name: v.my_name.trim() }));
+        await loadMembership(); toast("Institute created. Now add departments and invite teachers."); swap("inst/staff");
+      }
+    } else if (kind === "join") {
+      const code = v.code.replace(/[^A-Za-z0-9]/g, "").toUpperCase();
+      if (code.length !== 10) throw new Error("Invite codes have 10 letters and numbers, like ABCDE-23456.");
+      const r = await track(API.rpc("join_institute", { p_code: code, p_my_name: v.my_name.trim() }));
+      await loadMembership(); S.classes = null; toast(`You joined ${r && r.institute ? r.institute : "the institute"}`); swap("classes");
+    } else if (kind === "dept") {
+      await track(API.rpc("add_department", { p_name: v.name.trim() })); toast(`Added ${v.name.trim()}`); await loadInstitute(); redraw();
+      const n = document.getElementById("dept-name"); if (n) { n.value = ""; n.focus(); }
+    } else if (kind === "invite") {
+      const code = await track(API.rpc("create_invite", { p_name: v.name.trim(), p_role: v.role, p_department: v.department || null }));
+      S.newInvite = { code, name: v.name.trim(), role: v.role }; await loadInstitute(); redraw();
+      const n = document.getElementById("inv-name"); if (n) n.value = "";
     } else if (kind === "assess") {
       const id = f.dataset.id;
-      const a = await track(API.insert("assessments", { class_id: id, title: v.title.trim(), max_marks: Number(v.max), day: v.day }));
+      const a = await track(API.insert("assessments", { class_id: id, title: v.title.trim(), kind: v.kind || "Test", max_marks: Number(v.max), day: v.day }));
       const b = S.bundles[id]; b.assess = [a, ...b.assess].sort((x, y) => String(y.day).localeCompare(x.day));
       S.selAssess[id] = a.id; toast(`Added ${a.title}`); redraw();
     }
   } catch (err) {
     if (handleAuthError(err)) return;
-    if (["setup", "login", "signup", "forgot", "reset", "code", "class"].includes(kind)) { S.error = errMsg(err); route(); }
+    if (["setup", "login", "signup", "forgot", "reset", "code", "class", "institute", "join"].includes(kind)) { S.error = errMsg(err); route(); }
     else toast(errMsg(err));
   } finally { if (btn && btn.isConnected) btn.disabled = false; }
 });
 
+async function loadDay() {
+  redraw();
+  try { S.instDay = (await API.rpc("institute_day", { p_day: S.instDate })) || {}; redraw(); } catch (e) { toast(errMsg(e)); }
+}
+async function instAction(p, msg) {
+  try { await track(p); toast(msg); await loadInstitute(); redraw(); } catch (e) { toast(errMsg(e)); redraw(); }
+}
 function setMark(id, sid, m) {
   const b = S.bundles[id], day = S.date;
   const cur = (b.att[day] = b.att[day] || {});
@@ -591,12 +875,19 @@ async function autoRefresh() {
   try {
     if (p[0] === "report" && S.code) { if (await fetchReport()) drawReport(); }
     else if (p[0] === "class" && p[1] && API.signedIn && !S.confirm && !S.editStudent) { await loadClass(p[1]); if (curHash().split("/")[1] === p[1]) redraw(); }
+    else if (p[0] === "inst" && API.signedIn && !S.confirm && !/^(student|class)$/.test(p[1] || "")) { await loadInstitute(); if (curHash().split("/")[0] === "inst") redraw(); }
     else if (p[0] === "classes" && API.signedIn) { await loadClasses(); if (curHash() === "classes") route(); }
   } catch { /* try again next time */ }
 }
 setInterval(autoRefresh, 30000);
 document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") autoRefresh(); });
-window.SR_onResume = autoRefresh; // called by the Android app when it comes back to the front
+window.SR_onResume = autoRefresh;
+window.SR_back = function () {
+  if (S.confirm) { S.confirm = null; redraw(); return true; }
+  const b = app.querySelector('[data-act="back"]');
+  if (b) { b.click(); return true; }
+  return false; // first screen (My classes, a student's record, or the welcome screen): let the app close
+}; // called by the Android app when it comes back to the front
 
 route();
 })();
